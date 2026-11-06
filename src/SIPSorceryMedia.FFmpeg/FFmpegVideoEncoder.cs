@@ -2,14 +2,16 @@
 using Microsoft.Extensions.Logging;
 using SIPSorceryMedia.Abstractions;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 
 namespace SIPSorceryMedia.FFmpeg
 {
-    public sealed unsafe class FFmpegVideoEncoder : IVideoEncoder, IDisposable
+    public sealed unsafe class FFmpegVideoEncoder : IStreamVideoEncoder, IDisposable
     {
         // libvpx's realtime deadline defaults to cpu-used 0 (the slowest realtime speed), which
         // cannot keep up at higher resolutions (~12 fps for 1080p). 5 is a balanced realtime default
@@ -37,6 +39,11 @@ namespace SIPSorceryMedia.FFmpeg
         public event EventHandler<VideoEncoderStatistics>? OnVideoEncoderStatistics;
 
         private AVCodecContext* _encoderContext;
+
+        // The packet the encoder receives each encoded frame into. Allocated once and unreferenced after every
+        // frame rather than allocated per frame, and only ever touched under _encoderLock. Freed in Dispose.
+        private AVPacket* _encodedPacket;
+
         private AVCodecContext* _decoderContext;
         private AVCodecID _codecID;
         private AVHWDeviceType _HwDeviceType;
@@ -78,19 +85,78 @@ namespace SIPSorceryMedia.FFmpeg
 
         public byte[]? EncodeVideo(int width, int height, byte[] sample, VideoPixelFormatsEnum pixelFormat, VideoCodecsEnum codec)
         {
+            if (sample == null)
+            {
+                throw new ArgumentNullException(nameof(sample));
+            }
+
+            // FFmpeg reads the frame through a pointer, so an array shorter than the frame would be read past its end.
+            ValidateSample(width, height, sample, pixelFormat);
+
             fixed (byte* pSample = sample)
             {
-                return EncodeVideo(width, height, pSample, pixelFormat, codec);
+                var sink = new ArrayPacketSink();
+                return EncodeVideoCore(width, height, pSample, pixelFormat, codec, ref sink, out _) ? sink.Result : null;
             }
         }
 
         public byte[]? EncodeVideoFaster(RawImage rawImage, VideoCodecsEnum codec)
         {
-            byte* pSample = (byte*)rawImage.Sample;
-            return EncodeVideo(rawImage.Width, rawImage.Height, pSample, rawImage.PixelFormat, codec);
+            var sink = new ArrayPacketSink();
+            return EncodeVideoCore(rawImage.Width, rawImage.Height, (byte*)rawImage.Sample, rawImage.PixelFormat, codec, ref sink, out _) ? sink.Result : null;
         }
 
-        private byte[]? EncodeVideo(int width, int height, byte* sample, VideoPixelFormatsEnum pixelFormat, VideoCodecsEnum codec)
+        /// <summary>
+        /// Encodes a raw video frame and writes the encoded frame straight from FFmpeg's packet buffer to a stream,
+        /// without the intermediate managed array <see cref="EncodeVideo"/> allocates for every frame.
+        /// </summary>
+        /// <param name="width">The width of the raw frame in pixels.</param>
+        /// <param name="height">The height of the raw frame in pixels.</param>
+        /// <param name="sample">The raw frame, in <paramref name="pixelFormat"/> with no row padding.</param>
+        /// <param name="pixelFormat">The pixel format of <paramref name="sample"/>.</param>
+        /// <param name="codec">The codec to encode with.</param>
+        /// <param name="output">The writable stream to write the encoded frame to. It does not need to be seekable.</param>
+        /// <param name="bytesWritten">The number of bytes written to <paramref name="output"/>.</param>
+        /// <returns>True if an encoded frame was written, false if the encoder produced no output for this frame
+        /// (it needs more input, the frame was dropped by rate limiting, or the encoder is disposed).</returns>
+        /// <remarks>
+        /// Exactly one FFmpeg packet, the same bytes <see cref="EncodeVideo"/> would return, is written per successful
+        /// call. As with <see cref="EncodeVideo"/>, an encoder that has queued further packets internally delivers
+        /// them on later calls, in order, so frame boundaries are preserved. The write happens synchronously while
+        /// the packet is referenced; the packet's memory is never handed out beyond that.
+        /// </remarks>
+        public bool TryEncodeVideo(int width, int height, ReadOnlySpan<byte> sample, VideoPixelFormatsEnum pixelFormat, VideoCodecsEnum codec, Stream output, out int bytesWritten)
+        {
+            ValidateOutput(output);
+            ValidateSample(width, height, sample, pixelFormat);
+
+            fixed (byte* pSample = sample)
+            {
+                var sink = new StreamPacketSink(output);
+                return EncodeVideoCore(width, height, pSample, pixelFormat, codec, ref sink, out bytesWritten) && bytesWritten > 0;
+            }
+        }
+
+        /// <summary>
+        /// The <see cref="RawImage"/> counterpart of <see cref="EncodeVideoFaster"/> that writes the encoded frame to
+        /// a stream instead of returning a new array. Used by <see cref="FFmpegVideoEndPoint"/>.
+        /// </summary>
+        /// <returns>True if an encoded frame was written, false if the encoder produced no output for this frame.</returns>
+        /// <remarks>
+        /// <see cref="RawImage.Sample"/> only has to stay valid for the duration of the call, the encoder takes its
+        /// own copy of the frame.
+        /// </remarks>
+        internal bool TryEncodeVideo(RawImage rawImage, VideoCodecsEnum codec, Stream output, out int bytesWritten)
+        {
+            ValidateRawImage(rawImage);
+            ValidateOutput(output);
+
+            var sink = new StreamPacketSink(output);
+            return EncodeVideoCore(rawImage.Width, rawImage.Height, (byte*)rawImage.Sample, rawImage.PixelFormat, codec, ref sink, out bytesWritten) && bytesWritten > 0;
+        }
+
+        private bool EncodeVideoCore<TSink>(int width, int height, byte* sample, VideoPixelFormatsEnum pixelFormat, VideoCodecsEnum codec, ref TSink sink, out int bytesWritten)
+            where TSink : struct, IEncodedPacketSink
         {
             AVCodecID? codecID = FFmpegConvert.GetAVCodecID(codec);
 
@@ -104,7 +170,55 @@ namespace SIPSorceryMedia.FFmpeg
                 throw new NotImplementedException($"No matching FFmpeg pixel format was found for video pixel format {pixelFormat}.");
             }
 
-            return Encode(codecID.Value, sample, width, height, Helper.DEFAULT_VIDEO_FRAME_RATE, false, avPixelFormat);
+            return EncodeSampleCore(codecID.Value, sample, width, height, Helper.DEFAULT_VIDEO_FRAME_RATE, false, avPixelFormat, ref sink, out bytesWritten);
+        }
+
+        private static void ValidateOutput(Stream output)
+        {
+            if (output == null)
+            {
+                throw new ArgumentNullException(nameof(output));
+            }
+
+            // Checked before encoding so a frame is not consumed by the encoder and then lost on the write.
+            if (!output.CanWrite)
+            {
+                throw new ArgumentException("The output stream must be writable.", nameof(output));
+            }
+        }
+
+        private static void ValidateRawImage(RawImage rawImage)
+        {
+            if (rawImage == null)
+            {
+                throw new ArgumentNullException(nameof(rawImage));
+            }
+        }
+
+        /// <summary>
+        /// FFmpeg reads the raw frame through a bare pointer, so a sample that is shorter than the frame would be read
+        /// past its end. Wherever the length is known, an array or a span, a sample that is too small is refused. The
+        /// pointer based methods (RawImage, byte*) cannot check and still trust their caller.
+        /// </summary>
+        private void ValidateSample(int width, int height, ReadOnlySpan<byte> sample, VideoPixelFormatsEnum pixelFormat)
+        {
+            var avPixelFormat = GetAVPixelFormat(pixelFormat);
+
+            if (avPixelFormat == AVPixelFormat.AV_PIX_FMT_NONE)
+            {
+                // Reported by the encode path with the same exception the array methods use.
+                return;
+            }
+
+            // Both the direct and the converted paths map the sample with av_image_fill_arrays and an alignment of 1,
+            // so this is exactly the number of bytes FFmpeg will read. Invalid dimensions give a negative error code,
+            // which is also left to the encode path to report.
+            int requiredSize = ffmpeg.av_image_get_buffer_size(avPixelFormat, width, height, 1);
+
+            if (requiredSize >= 0 && sample.Length < requiredSize)
+            {
+                throw new ArgumentException($"The {pixelFormat} sample of {sample.Length} bytes is too small for a {width}x{height} frame, which needs {requiredSize} bytes.", nameof(sample));
+            }
         }
 
         public void ForceKeyFrame()
@@ -464,7 +578,9 @@ namespace SIPSorceryMedia.FFmpeg
                         ffmpeg.avcodec_free_context(pCtx);
                     }
 
-                    UnsafeReset();
+                    // Only the encoder's state is reset. UnsafeReset would also free the frames the decoder decodes
+                    // into, which a decoder in use on this instance still needs.
+                    _negotiatedPixFmt = null;
                 }
             }
         }
@@ -575,22 +691,41 @@ namespace SIPSorceryMedia.FFmpeg
 
             ffmpeg.av_image_fill_arrays(ref data, ref linesize, sample, AVPixelFormat.AV_PIX_FMT_YUV420P, width, height, 1).ThrowExceptionIfError();
 
-            avFrame.data.UpdateFrom(data);
-            avFrame.linesize.UpdateFrom(linesize);
+            // Element by element rather than with UpdateFrom, which takes arrays: converting the fixed size structs to
+            // arrays would allocate twice for every frame encoded.
+            for (uint i = 0; i < 4; i++)
+            {
+                avFrame.data[i] = data[i];
+                avFrame.linesize[i] = linesize[i];
+            }
 
             return avFrame;
         }
 
-        private bool CheckDropFrame()
+        /// <summary>
+        /// Rate limits frames to the encoder's frame rate when statistics are subscribed. Must be called with
+        /// _encoderLock held, as it reads the encoder context.
+        /// </summary>
+        /// <param name="fps">The frame rate the frame is being encoded at, used until the encoder context exists.</param>
+        private bool CheckDropFrame(int fps)
         {
             if (_frameTimer == null)
             {
                 _frameTimer = new Stopwatch();
                 _frameTimer.Start();
             }
+
+            // The encoder's frame rate, which AdjustStream can change. Before the first frame there is no encoder
+            // context yet, so the requested rate is used.
+            int frameRate = _encoderContext != null ? _encoderContext->framerate.num : fps;
+            if (frameRate <= 0)
+            {
+                return false;
+            }
+
             // Calculate frame interval in ticks based on Stopwatch frequency.
             // frameIntervalMs = 1000 / framerate, convert ms to ticks: frameIntervalTicks = frameIntervalMs * Stopwatch.Frequency / 1000
-            long frameIntervalTicks = (long)(1000.0 / _encoderContext->framerate.num * Stopwatch.Frequency / 1000);
+            long frameIntervalTicks = (long)(1000.0 / frameRate * Stopwatch.Frequency / 1000);
 
             long nowTicks = _frameTimer.ElapsedTicks;
             if (_lastFrameTicks != 0)
@@ -608,6 +743,21 @@ namespace SIPSorceryMedia.FFmpeg
 
         public byte[]? Encode(AVCodecID codecID, byte* sample, int width, int height, int fps, bool keyFrame = false, AVPixelFormat pixelFormat = AVPixelFormat.AV_PIX_FMT_YUV420P)
         {
+            var sink = new ArrayPacketSink();
+            return EncodeSampleCore(codecID, sample, width, height, fps, keyFrame, pixelFormat, ref sink, out _) ? sink.Result : null;
+        }
+
+        public byte[]? Encode(AVCodecID codecID, AVFrame* avFrame, int fps, bool keyFrame = false)
+        {
+            var sink = new ArrayPacketSink();
+            return EncodeCore(codecID, avFrame, fps, keyFrame, ref sink, out _) ? sink.Result : null;
+        }
+
+        private bool EncodeSampleCore<TSink>(AVCodecID codecID, byte* sample, int width, int height, int fps, bool keyFrame, AVPixelFormat pixelFormat, ref TSink sink, out int bytesWritten)
+            where TSink : struct, IEncodedPacketSink
+        {
+            bytesWritten = 0;
+
             if (!_isDisposed)
             {
                 lock (_encoderLock)
@@ -650,29 +800,46 @@ namespace SIPSorceryMedia.FFmpeg
                             avFrame = _encoderPixelConverter.Convert(sample);
                         }
 
-                        return Encode(codecID, &avFrame, fps, keyFrame);
+                        return EncodeCore(codecID, &avFrame, fps, keyFrame, ref sink, out bytesWritten);
                     }
                     else
                     {
-                        return null;
+                        return false;
                     }
                 }
             }
             else
             {
-                return null;
+                return false;
             }
         }
 
-        public byte[]? Encode(AVCodecID codecID, AVFrame* avFrame, int fps, bool keyFrame = false)
+        /// <summary>
+        /// The single encode path shared by every public encode method. Sends one frame to the encoder, receives at
+        /// most one packet and hands that packet's bytes to the sink while the packet is still referenced.
+        /// </summary>
+        /// <returns>True if the encoder produced a packet (which the sink was given), false if it produced none.</returns>
+        private bool EncodeCore<TSink>(AVCodecID codecID, AVFrame* avFrame, int fps, bool keyFrame, ref TSink sink, out int bytesWritten)
+            where TSink : struct, IEncodedPacketSink
         {
+            bytesWritten = 0;
+
             if (!_isDisposed)
             {
-                if (OnVideoEncoderStatistics != null && CheckDropFrame()) {
-                    return null;
-                }
                 lock (_encoderLock)
                 {
+                    // Dispose frees the encoder context and packet under this lock, so check again now that it is held.
+                    if (_isDisposed)
+                    {
+                        return false;
+                    }
+
+                    // Inside the lock: the check reads the encoder context, which Dispose frees under it.
+                    if (OnVideoEncoderStatistics != null && CheckDropFrame(fps))
+                    {
+                        return false;
+                    }
+
                     int width = avFrame->width;
                     int height = avFrame->height;
 
@@ -709,52 +876,128 @@ namespace SIPSorceryMedia.FFmpeg
 
                     avFrame->pts = _pts++;
 
-                    var pPacket = ffmpeg.av_packet_alloc();
+                    // One packet, allocated on first use, receives every encoded frame. It is unreferenced after each
+                    // frame and freed in Dispose.
+                    AVPacket* packet = _encodedPacket;
+                    if (packet == null)
+                    {
+                        packet = _encodedPacket = ffmpeg.av_packet_alloc();
+
+                        if (packet == null)
+                        {
+                            throw new ApplicationException("Failed to allocate the encoder packet.");
+                        }
+                    }
+
                     OnVideoEncoderStatistics?.Invoke(this, new VideoEncoderStatistics(width, height, fps, FFmpegConvert.GetVideoCodecEnum(_codecID)));
                     try
                     {
+                        // A frame that is not reference counted, which is what MakeFrame and the pixel converter
+                        // produce, is copied by avcodec_send_frame. The caller's sample is therefore not needed once
+                        // this returns.
                         ffmpeg.avcodec_send_frame(_encoderContext, avFrame).ThrowExceptionIfError();
-                        int error = ffmpeg.avcodec_receive_packet(_encoderContext, pPacket);
+                        int error = ffmpeg.avcodec_receive_packet(_encoderContext, packet);
 
                         if (error == 0)
                         {
                             //TracePacket(pPacket, "hevc_mp4toannexb");
 
-                            if (_codecID == AVCodecID.AV_CODEC_ID_H264)
-                            {
-                                // TODO: Work out how to use the FFmpeg H264 bit stream parser to extract the NALs.
-                                // Currently it's being done in the RTPSession class.
-                                byte[] arr = new byte[pPacket->size];
-                                Marshal.Copy((IntPtr)pPacket->data, arr, 0, pPacket->size);
-                                return arr;
-                            }
-                            else
-                            {
-                                byte[] arr = new byte[pPacket->size];
-                                Marshal.Copy((IntPtr)pPacket->data, arr, 0, pPacket->size);
-                                return arr;
-                            }
+                            // TODO: Work out how to use the FFmpeg H264 bit stream parser to extract the NALs.
+                            // Currently it's being done in the RTPSession class.
+
+                            // The packet data belongs to FFmpeg and is only valid until the unref below, so it is
+                            // written to the sink here, synchronously, and the span is never stored.
+                            sink.Write(new ReadOnlySpan<byte>(packet->data, packet->size));
+                            bytesWritten = packet->size;
+                            return true;
                         }
                         else if (error == ffmpeg.AVERROR(ffmpeg.EAGAIN))
                         {
                             logger.LogDebug("Video encoder needs more data.");
-                            return null;
+                            return false;
                         }
                         else
                         {
                             error.ThrowExceptionIfError();
-                            return null;
+                            return false;
                         }
                     }
                     finally
                     {
-                        ffmpeg.av_packet_unref(pPacket);
+                        ffmpeg.av_packet_unref(packet);
                     }
                 }
             }
             else
             {
-                return null;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Receives the bytes of an encoded packet. Implemented by structs so the shared encode path is specialised for
+        /// each destination with no delegate or interface allocation.
+        /// </summary>
+        /// <remarks>
+        /// The span passed to <see cref="Write"/> points at FFmpeg owned memory that is only valid for the duration of
+        /// the call. Implementations must copy what they need and must not keep the span.
+        /// </remarks>
+        private interface IEncodedPacketSink
+        {
+            void Write(ReadOnlySpan<byte> packet);
+        }
+
+        /// <summary>
+        /// Copies the packet into a new array, for the array returning methods.
+        /// </summary>
+        private struct ArrayPacketSink : IEncodedPacketSink
+        {
+            public byte[]? Result;
+
+            public void Write(ReadOnlySpan<byte> packet) => Result = packet.ToArray();
+        }
+
+        /// <summary>
+        /// Writes the packet to a stream with a single write and no intermediate managed array.
+        /// </summary>
+        private readonly struct StreamPacketSink : IEncodedPacketSink
+        {
+#if !(NETSTANDARD2_1_OR_GREATER || NETCOREAPP2_1_OR_GREATER)
+            // Without Stream.Write(ReadOnlySpan<byte>) the packet has to be passed to the stream from an array. A
+            // pooled one is used, in chunks of at most this size, so there is still no per-frame allocation.
+            private const int MAX_POOLED_CHUNK_SIZE = 81920;
+#endif
+
+            private readonly Stream _output;
+
+            public StreamPacketSink(Stream output) => _output = output;
+
+            public void Write(ReadOnlySpan<byte> packet)
+            {
+                if (packet.IsEmpty)
+                {
+                    return;
+                }
+
+#if NETSTANDARD2_1_OR_GREATER || NETCOREAPP2_1_OR_GREATER
+                _output.Write(packet);
+#else
+                byte[] chunk = ArrayPool<byte>.Shared.Rent(Math.Min(packet.Length, MAX_POOLED_CHUNK_SIZE));
+                try
+                {
+                    while (!packet.IsEmpty)
+                    {
+                        int count = Math.Min(packet.Length, chunk.Length);
+                        packet.Slice(0, count).CopyTo(chunk);
+                        _output.Write(chunk, 0, count);
+                        packet = packet.Slice(count);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(chunk);
+                }
+#endif
             }
         }
 
@@ -972,7 +1215,10 @@ namespace SIPSorceryMedia.FFmpeg
 
             _isDisposed = true;
 
-            lock (this)
+            // The native encoder and decoder state is freed under the same lock its users hold, so an encode or
+            // decode in flight on another thread finishes before anything it is using is released, and any that
+            // starts afterwards sees _isDisposed once it has the lock and returns without touching it.
+            lock (_encoderLock)
             {
                 if (_encoderContext != null)
                 {
@@ -982,6 +1228,23 @@ namespace SIPSorceryMedia.FFmpeg
                     }
                 }
 
+                if (_encodedPacket != null)
+                {
+                    fixed (AVPacket** pPacket = &_encodedPacket)
+                    {
+                        ffmpeg.av_packet_free(pPacket);
+                    }
+                }
+
+                // The pixel converters hold unmanaged frame buffers allocated with Marshal.AllocHGlobal.
+                _encoderPixelConverter?.Dispose();
+                _encoderPixelConverter = null;
+
+                _frameTimer?.Stop();
+            }
+
+            lock (_decoderLock)
+            {
                 if (_decoderContext != null)
                 {
                     fixed (AVCodecContext** pCtx = &_decoderContext)
@@ -1006,20 +1269,6 @@ namespace SIPSorceryMedia.FFmpeg
                     }
                 }
 
-                _frameTimer?.Stop();
-            }
-
-            // The pixel converters hold unmanaged frame buffers allocated with Marshal.AllocHGlobal.
-            // Take each converter's own lock rather than the one above so a decode or encode in
-            // flight cannot be pulled out from under.
-            lock (_encoderLock)
-            {
-                _encoderPixelConverter?.Dispose();
-                _encoderPixelConverter = null;
-            }
-
-            lock (_decoderLock)
-            {
                 _i420ToBgr?.Dispose();
                 _i420ToBgr = null;
             }

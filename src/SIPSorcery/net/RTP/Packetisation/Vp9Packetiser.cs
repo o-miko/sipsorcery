@@ -45,7 +45,7 @@ public static class Vp9Packetiser
 
     // Flag octet plus a 15-bit (2 byte) picture ID. The simple single-layer streams the
     // SIPSorcery encoders emit never set L/F/V, so the descriptor is always this length.
-    private const int DESCRIPTOR_LENGTH = 3;
+    internal const int DESCRIPTOR_LENGTH = 3;
 
     public const int MAX_PICTURE_ID = 0x7FFF;
 
@@ -72,7 +72,6 @@ public static class Vp9Packetiser
             throw new ArgumentException("The maximum RTP payload size is too small for VP9 packetisation.", nameof(maxPayloadSize));
         }
 
-        int id = pictureId & MAX_PICTURE_ID;
         int offset = 0;
         bool first = true;
 
@@ -81,15 +80,8 @@ public static class Vp9Packetiser
             int chunk = Math.Min(capacity, frame.Length - offset);
             bool last = offset + chunk >= frame.Length;
 
-            byte flags = I_BIT;
-            if (!isKeyFrame) { flags |= P_BIT; }
-            if (first) { flags |= B_BIT; }
-            if (last) { flags |= E_BIT; }
-
             var payload = new byte[DESCRIPTOR_LENGTH + chunk];
-            payload[0] = flags;
-            payload[1] = (byte)(0x80 | ((id >> 8) & 0x7F)); // M bit set, top 7 bits of the picture ID.
-            payload[2] = (byte)(id & 0xFF);
+            WritePayloadDescriptor(payload, isKeyFrame, first, last, pictureId);
             Buffer.BlockCopy(frame, offset, payload, DESCRIPTOR_LENGTH, chunk);
             packets.Add(payload);
 
@@ -101,12 +93,42 @@ public static class Vp9Packetiser
     }
 
     /// <summary>
+    /// Writes the VP9 payload descriptor that <see cref="Packetize"/> puts at the start of each payload.
+    /// </summary>
+    /// <param name="destination">Where to write the descriptor, at least <see cref="DESCRIPTOR_LENGTH"/> bytes.</param>
+    /// <param name="isKeyFrame">Whether the frame is a key frame; clears the P (inter-predicted) flag when true.</param>
+    /// <param name="isFirst">Whether this is the frame's first payload (B flag).</param>
+    /// <param name="isLast">Whether this is the frame's last payload (E flag).</param>
+    /// <param name="pictureId">The 15-bit picture ID of the frame.</param>
+    /// <returns>The number of bytes written, <see cref="DESCRIPTOR_LENGTH"/>.</returns>
+    internal static int WritePayloadDescriptor(Span<byte> destination, bool isKeyFrame, bool isFirst, bool isLast, int pictureId)
+    {
+        int id = pictureId & MAX_PICTURE_ID;
+
+        byte flags = I_BIT;
+        if (!isKeyFrame) { flags |= P_BIT; }
+        if (isFirst) { flags |= B_BIT; }
+        if (isLast) { flags |= E_BIT; }
+
+        destination[0] = flags;
+        destination[1] = (byte)(0x80 | ((id >> 8) & 0x7F)); // M bit set, top 7 bits of the picture ID.
+        destination[2] = (byte)(id & 0xFF);
+        return DESCRIPTOR_LENGTH;
+    }
+
+    /// <summary>
     /// Determines whether an encoded VP9 frame is a key frame by parsing the start of its uncompressed
     /// header (frame_marker, profile, show_existing_frame, frame_type).
     /// </summary>
-    public static bool IsKeyFrame(byte[] frame)
+    public static bool IsKeyFrame(byte[] frame) => frame != null && IsKeyFrame(frame.AsSpan());
+
+    /// <summary>
+    /// Determines whether an encoded VP9 frame is a key frame by parsing the start of its uncompressed
+    /// header (frame_marker, profile, show_existing_frame, frame_type).
+    /// </summary>
+    public static bool IsKeyFrame(ReadOnlySpan<byte> frame)
     {
-        if (frame == null || frame.Length < 1)
+        if (frame.Length < 1)
         {
             return false;
         }

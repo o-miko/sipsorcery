@@ -33,6 +33,7 @@ them generically.
 |---|---|---|
 | `IAudioEncoder` | You provide audio encoding / decoding (G711, G722, G729, Opus, ...) | [`AudioEncoder`](https://github.com/sipsorcery-org/sipsorcery/blob/master/src/app/Media/Codecs/AudioEncoder.cs) in the main SIPSorcery package |
 | `IVideoEncoder` | You provide video encoding / decoding (VP8, H.264, ...) | [`Vp8NetVideoEncoder`](https://github.com/sipsorcery-org/sipsorcery/blob/master/src/SIPSorcery.VP8/Vp8NetVideoEncoderEndPoint.cs) (pure C#); FFmpeg wrappers in `SIPSorceryMedia.FFmpeg` |
+| `IStreamVideoEncoder` | Optional, in addition to `IVideoEncoder`: your encoder can write each encoded frame straight to a caller supplied `Stream` instead of returning a new array per frame | `VP8Codec` in `SIPSorcery.VP8`; `FFmpegVideoEncoder` in `SIPSorceryMedia.FFmpeg` |
 
 ### Audio source / sink interfaces
 
