@@ -239,6 +239,8 @@ namespace Vpx.Net
                 AboveVRow = new byte[chromaW];
             }
 
+            // Allocated pinned: the boolean coders keep raw pointers into OutBuf outside the fixed blocks that set them
+            // up, so the GC must not move it while a frame is being encoded.
             int bufLen = System.Math.Max(4096, width * height * 2 + 1024);
             if (OutBuf == null || OutBuf.Length < bufLen)
                 OutBuf = System.GC.AllocateArray<byte>(bufLen, pinned: true);
@@ -1199,7 +1201,7 @@ namespace Vpx.Net
 
         private static void ExtractRowInto(byte[] src, int offset, int count, byte[] dst)
         {
-            for (int i = 0; i < count; i++) dst[i] = src[offset + i];
+            src.AsSpan(offset, count).CopyTo(dst);
         }
 
         private static void ExtractColumnInto(byte[] src, int srcStride, int columnIndex, int rows, byte[] dst)
@@ -1210,7 +1212,7 @@ namespace Vpx.Net
         private static void CopyRowOut(byte[] src, int srcStride, int srcRow,
             byte[] dst, int dstOffset, int count)
         {
-            for (int i = 0; i < count; i++) dst[dstOffset + i] = src[srcRow * srcStride + i];
+            src.AsSpan(srcRow * srcStride, count).CopyTo(dst.AsSpan(dstOffset));
         }
     }
 }
